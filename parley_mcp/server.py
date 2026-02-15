@@ -341,6 +341,307 @@ def proxy_status(instance_id: str) -> str:
 
 
 # =====================================================================
+#  WEB PROXY CONVENIENCE TOOL
+# =====================================================================
+
+_CLIENT_REWRITE_TEMPLATE = r'''
+import re
+def module_function(message_num, source_ip, source_port,
+                    dest_ip, dest_port, message_data):
+    TARGET_WWW = b'{target_www}'
+    PROXY = b'{proxy_addr}'
+    data = bytes(message_data)
+    data = re.sub(rb'(host:\s*)' + re.escape(PROXY), b'\\1' + TARGET_WWW, data, flags=re.IGNORECASE)
+    data = re.sub(rb'(origin:\s*)http://' + re.escape(PROXY), b'\\1https://' + TARGET_WWW, data, flags=re.IGNORECASE)
+    data = re.sub(rb'(referer:\s*)http://' + re.escape(PROXY), b'\\1https://' + TARGET_WWW, data, flags=re.IGNORECASE)
+    data = re.sub(rb'accept-encoding:.*?\r\n', b'', data, flags=re.IGNORECASE)
+    data = re.sub(rb'if-modified-since:.*?\r\n', b'', data, flags=re.IGNORECASE)
+    data = re.sub(rb'if-none-match:.*?\r\n', b'', data, flags=re.IGNORECASE)
+    data = re.sub(rb'cache-control:.*?\r\n', b'', data, flags=re.IGNORECASE)
+    data = re.sub(rb'pragma:.*?\r\n', b'', data, flags=re.IGNORECASE)
+    data = re.sub(rb'upgrade-insecure-requests:.*?\r\n', b'', data, flags=re.IGNORECASE)
+    data = re.sub(rb'connection:.*?\r\n', b'', data, flags=re.IGNORECASE)
+    data = data.replace(b'\r\n\r\n', b'\r\nConnection: close\r\nCache-Control: no-cache\r\nPragma: no-cache\r\n\r\n', 1)
+    return bytearray(data)
+'''
+
+_SERVER_REWRITE_TEMPLATE = r'''
+import re
+import zlib
+
+_state = {{}}
+
+def _conn_key(src_ip, src_port, dst_ip, dst_port):
+    return f"{{src_ip}}:{{src_port}}-{{dst_ip}}:{{dst_port}}"
+
+def _process_headers(headers, PROXY):
+    headers = re.sub(rb'(location:\s*)https?://(?:www\.)?{target_re}', b'\\1http://' + PROXY, headers, flags=re.IGNORECASE)
+    headers = re.sub(rb';\s*domain=[^;\r\n]+', b'', headers, flags=re.IGNORECASE)
+    headers = re.sub(rb';\s*secure\b', b'', headers, flags=re.IGNORECASE)
+    headers = re.sub(rb';\s*samesite=none', b'; SameSite=Lax', headers, flags=re.IGNORECASE)
+    headers = re.sub(rb'transfer-encoding:.*?\r\n', b'', headers, flags=re.IGNORECASE)
+    headers = re.sub(rb'content-length:.*?\r\n', b'', headers, flags=re.IGNORECASE)
+    headers = re.sub(rb'content-encoding:.*?\r\n', b'', headers, flags=re.IGNORECASE)
+    headers = re.sub(rb'connection:.*?\r\n', b'', headers, flags=re.IGNORECASE)
+    headers = re.sub(rb'strict-transport-security:.*?\r\n', b'', headers, flags=re.IGNORECASE)
+    headers = re.sub(rb'content-security-policy:.*?\r\n', b'', headers, flags=re.IGNORECASE)
+    headers = re.sub(rb'content-security-policy-report-only:.*?\r\n', b'', headers, flags=re.IGNORECASE)
+    headers = re.sub(rb'x-frame-options:.*?\r\n', b'', headers, flags=re.IGNORECASE)
+    headers = re.sub(rb'permissions-policy:.*?\r\n', b'', headers, flags=re.IGNORECASE)
+    headers = re.sub(rb'cache-control:.*?\r\n', b'', headers, flags=re.IGNORECASE)
+    headers = re.sub(rb'etag:.*?\r\n', b'', headers, flags=re.IGNORECASE)
+    headers = re.sub(rb'last-modified:.*?\r\n', b'', headers, flags=re.IGNORECASE)
+    headers = re.sub(rb'expires:.*?\r\n', b'', headers, flags=re.IGNORECASE)
+    headers = re.sub(rb'age:.*?\r\n', b'', headers, flags=re.IGNORECASE)
+    headers = re.sub(rb'(access-control-allow-origin:\s*)https?://(?:www\.)?{target_re}', b'\\1http://' + PROXY, headers, flags=re.IGNORECASE)
+    headers += b'\r\nConnection: close'
+    headers += b'\r\nCache-Control: no-store, no-cache, must-revalidate, max-age=0'
+    headers += b'\r\nPragma: no-cache'
+    headers += b'\r\nExpires: 0'
+    return headers
+
+def _do_body_replace(data):
+    PROXY = b'{proxy_addr}'
+    PROXY_HOST = b'{proxy_host}'
+    data = data.replace(b'https://{target_www}', b'http://' + PROXY)
+    data = data.replace(b'http://{target_www}', b'http://' + PROXY)
+    data = data.replace(b'https://{target_bare}', b'http://' + PROXY)
+    data = data.replace(b'http://{target_bare}', b'http://' + PROXY)
+    data = data.replace(b'//{target_www}', b'//' + PROXY)
+    data = data.replace(b'//{target_bare}', b'//' + PROXY)
+    data = data.replace(b"COOKIE_DOMAIN = '{target_bare}'", b"COOKIE_DOMAIN = ''")
+    data = data.replace(b"COOKIE_DOMAIN = '{target_www}'", b"COOKIE_DOMAIN = ''")
+    data = data.replace(b"cbDomainName = '{target_bare}'", b"cbDomainName = ''")
+    data = data.replace(b'.{target_bare}', b'.' + PROXY_HOST)
+    data = data.replace(b'!func.isInWhitelist()', b'false')
+    return data
+
+def _dechunk(st, raw):
+    result = bytearray()
+    buf = st.get('chunk_buf', bytearray()) + raw
+    while buf:
+        remaining = st.get('chunk_remaining', 0)
+        if remaining > 0:
+            take = min(remaining, len(buf))
+            result.extend(buf[:take])
+            buf = buf[take:]
+            st['chunk_remaining'] = remaining - take
+            if st['chunk_remaining'] == 0:
+                if buf.startswith(b'\r\n'):
+                    buf = buf[2:]
+                elif len(buf) == 1 and buf == b'\r':
+                    st['chunk_buf'] = bytearray(buf)
+                    return bytes(result)
+            continue
+        idx = buf.find(b'\r\n')
+        if idx == -1:
+            st['chunk_buf'] = bytearray(buf)
+            return bytes(result)
+        size_line = bytes(buf[:idx]).strip()
+        buf = buf[idx + 2:]
+        if not size_line:
+            continue
+        if b';' in size_line:
+            size_line = size_line.split(b';')[0]
+        try:
+            chunk_size = int(size_line, 16)
+        except ValueError:
+            result.extend(size_line + b'\r\n')
+            result.extend(buf)
+            buf = bytearray()
+            break
+        if chunk_size == 0:
+            st['done'] = True
+            break
+        st['chunk_remaining'] = chunk_size
+    st['chunk_buf'] = bytearray()
+    return bytes(result)
+
+def module_function(message_num, source_ip, source_port,
+                    dest_ip, dest_port, message_data):
+    PROXY = b'{proxy_addr}'
+    key = _conn_key(source_ip, source_port, dest_ip, dest_port)
+    data = bytes(message_data)
+    if data.startswith(b'HTTP/'):
+        _state[key] = {{
+            'phase': 'headers',
+            'header_buf': bytearray(),
+            'chunked': False,
+            'chunk_buf': bytearray(),
+            'chunk_remaining': 0,
+        }}
+    st = _state.get(key)
+    if st is None:
+        return bytearray(_do_body_replace(data))
+    if st['phase'] == 'headers':
+        st['header_buf'].extend(data)
+        if b'\r\n\r\n' not in st['header_buf']:
+            return bytearray()
+        raw = bytes(st['header_buf'])
+        header_bytes, body_start = raw.split(b'\r\n\r\n', 1)
+        if re.search(rb'transfer-encoding:\s*chunked', header_bytes, re.IGNORECASE):
+            st['chunked'] = True
+        enc_match = re.search(rb'content-encoding:\s*(\S+)', header_bytes, re.IGNORECASE)
+        if enc_match and body_start:
+            encoding = enc_match.group(1).lower()
+            try:
+                if encoding == b'gzip':
+                    body_start = zlib.decompress(body_start, zlib.MAX_WBITS | 16)
+                elif encoding == b'deflate':
+                    body_start = zlib.decompress(body_start, -zlib.MAX_WBITS)
+            except Exception:
+                pass
+        processed_headers = _process_headers(header_bytes, PROXY)
+        st['phase'] = 'body'
+        if st['chunked'] and body_start:
+            body_start = _dechunk(st, body_start)
+        body_start = _do_body_replace(body_start)
+        return bytearray(processed_headers + b'\r\n\r\n' + body_start)
+    elif st['phase'] == 'body':
+        if st['chunked']:
+            data = _dechunk(st, data)
+        data = _do_body_replace(data)
+        return bytearray(data)
+    return message_data
+'''
+
+
+@mcp.tool()
+def web_proxy_setup(
+    target_domain: str,
+    listen_port: int = 8080,
+    listen_host: str = "127.0.0.1",
+    target_port: int = 443
+) -> str:
+    """Set up a complete web proxy with full HTTP rewriting in one call.
+
+    Creates a TLS-decrypting proxy and automatically deploys battle-tested
+    client and server rewriting modules that handle:
+    - Header rewriting (Host, Origin, Referer, cookies, security headers)
+    - Chunked transfer-encoding (stateful de-chunking across TCP segments)
+    - Header buffering (handles headers split across TLS records)
+    - Cookie fixing (strips domain/Secure, fixes SameSite)
+    - Cache busting (strips and replaces all cache headers)
+    - URL rewriting in HTML/JS/CSS bodies
+    - JavaScript domain variable patching (COOKIE_DOMAIN, etc.)
+    - Anti-hotlinking bypass
+    - HSTS, CSP, X-Frame-Options stripping
+
+    Point your browser at http://{listen_host}:{listen_port} after setup.
+
+    Args:
+        target_domain: Domain to proxy (e.g. "example.com"). Handles
+                       both bare and www-prefixed variants automatically.
+        listen_port: Local port to listen on (default: 8080)
+        listen_host: Local address to listen on (default: 127.0.0.1)
+        target_port: Target HTTPS port (default: 443)
+    """
+    import re as _re
+
+    # Normalize domain: strip protocol and trailing slashes
+    domain = target_domain.strip().lower()
+    domain = _re.sub(r'^https?://', '', domain)
+    domain = domain.rstrip('/')
+
+    # Determine bare and www variants
+    if domain.startswith('www.'):
+        target_bare = domain[4:]
+        target_www = domain
+    else:
+        target_bare = domain
+        target_www = f"www.{domain}"
+
+    proxy_addr = f"{listen_host}:{listen_port}"
+    proxy_host = listen_host
+
+    # Escape domain for regex (dots become literal)
+    target_re = target_bare.replace('.', r'\.')
+
+    try:
+        # 1. Start the proxy
+        name = f"web-{target_bare}"
+        config = {
+            'listen_host': listen_host,
+            'listen_port': listen_port,
+            'target_host': target_bare,
+            'target_port': target_port,
+            'use_tls_client': False,
+            'use_tls_server': True,
+            'no_verify': True,
+            'certfile': None,
+            'keyfile': None,
+            'client_certfile': None,
+            'client_keyfile': None,
+            'cipher': None,
+            'ssl_version': None,
+        }
+        instance_id = db.create_instance(name=name, **config)
+        proxy_engine.start_instance(instance_id, config)
+
+        # 2. Generate and deploy client rewrite module
+        client_code = _CLIENT_REWRITE_TEMPLATE.format(
+            target_www=target_www,
+            proxy_addr=proxy_addr,
+        )
+        is_valid, error = module_manager.validate_module_code(client_code)
+        if not is_valid:
+            return f"ERROR: Client module validation failed - {error}"
+
+        client_mod_id = db.create_module(
+            name="Web_Client_Rewrite",
+            direction="client",
+            code=client_code,
+            description=f"Rewrite client headers for {target_bare} web proxy",
+            instance_id=instance_id,
+            enabled=True,
+            priority=10
+        )
+
+        # 3. Generate and deploy server rewrite module
+        server_code = _SERVER_REWRITE_TEMPLATE.format(
+            target_www=target_www,
+            target_bare=target_bare,
+            target_re=target_re,
+            proxy_addr=proxy_addr,
+            proxy_host=proxy_host,
+        )
+        is_valid, error = module_manager.validate_module_code(server_code)
+        if not is_valid:
+            return f"ERROR: Server module validation failed - {error}"
+
+        server_mod_id = db.create_module(
+            name="Web_Server_Rewrite",
+            direction="server",
+            code=server_code,
+            description=f"Stateful rewrite for {target_bare}: headers, de-chunk, cookies, URLs, security",
+            instance_id=instance_id,
+            enabled=True,
+            priority=10
+        )
+
+        module_manager.invalidate()
+
+        return (
+            f"Web proxy setup complete!\n\n"
+            f"  Instance ID  : {instance_id}\n"
+            f"  Proxy URL    : http://{proxy_addr}\n"
+            f"  Target       : {target_bare}:{target_port} (TLS, no verify)\n"
+            f"  Client Mod   : {client_mod_id} (Web_Client_Rewrite)\n"
+            f"  Server Mod   : {server_mod_id} (Web_Server_Rewrite)\n\n"
+            f"Modules handle: header buffering, chunked de-encoding,\n"
+            f"cookie fixing, URL rewriting, JS domain patching,\n"
+            f"security header stripping, cache busting, hotlinker bypass.\n\n"
+            f"Open your browser to: http://{proxy_addr}\n\n"
+            f"Use instance ID '{instance_id}' for traffic_query, traffic_search, etc.\n"
+            f"Add custom modules with module_create for site-specific tweaks."
+        )
+    except OSError as e:
+        return f"ERROR: Failed to start web proxy - {e}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+# =====================================================================
 #  MODULE MANAGEMENT TOOLS
 # =====================================================================
 

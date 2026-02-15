@@ -1,6 +1,6 @@
 # Parley-MCP
 
-**Version:** 1.0.0
+**Version:** 1.0.1
 
 **AI-controlled multi-threaded TCP/TLS penetration testing proxy via Model Context Protocol.**
 
@@ -18,7 +18,7 @@ Parley-MCP gives an AI agent complete control of a multi-threaded application da
 - **Query and analyze** captured traffic for security testing
 - **Iterate rapidly** — modify modules, clear captures, re-test, analyze results
 
-This enables automated penetration testing workflows where the AI can set up a proxy, generate traffic through it (via browser or other MCPs), analyze what it sees, write modules to modify traffic programmatically, and repeat.
+This enables automated penetration testing workflows where the AI can set up a proxy, generate traffic through it (via browser or scripts), analyze what it sees, write modules to modify traffic programmatically, and repeat. The AI can also capture login flows, replay them with automated scripts, and identify security vulnerabilities from the captured traffic.
 
 ---
 
@@ -48,7 +48,17 @@ Add to your Cursor MCP settings (`.cursor/mcp.json`):
 
 ---
 
-## MCP Tools (14 total)
+## MCP Tools (15 total)
+
+### Web Proxy (One-Call Setup)
+
+| Tool | Description |
+|------|-------------|
+| `web_proxy_setup` | Complete web proxy with full HTTP rewriting in one call |
+
+Creates a TLS-decrypting proxy and auto-deploys client/server rewriting modules
+that handle header buffering, chunked de-encoding, cookie fixing, URL rewriting,
+JS domain patching, security header stripping, cache busting, and hotlinker bypass.
 
 ### Proxy Lifecycle
 
@@ -136,7 +146,51 @@ and the full Python standard library.
 
 ---
 
-## Typical Workflow
+## Typical Workflows
+
+### Web Testing (Quick Setup)
+
+```
+1. web_proxy_setup(target_domain="example.com", listen_port=8080)
+   → Proxy + rewriting modules deployed, ready to browse
+
+2. Open browser to http://127.0.0.1:8080
+
+3. traffic_query / traffic_search to analyze captured traffic
+
+4. module_create for any site-specific tweaks
+
+5. proxy_stop when done
+```
+
+### Login Capture & Automation
+
+```
+1. web_proxy_setup(target_domain="example.com", listen_port=8080)
+   → Proxy ready
+
+2. Browse to http://127.0.0.1:8080 and log in manually
+
+3. traffic_search(instance_id, pattern="POST")
+   → Find the login POST request with credentials and CSRF tokens
+
+4. traffic_query(instance_id, connection_id=N, show_modified=True)
+   → See full request/response including hidden fields, cookies, tokens
+
+5. Build a Python script using requests.Session() that:
+   - GETs the login page and extracts CSRF tokens from HTML
+   - POSTs credentials with all required fields/headers
+   - Validates the JSON response and session cookies
+
+6. Run the script through the proxy for ongoing traffic capture
+
+7. Analyze captured traffic for security issues:
+   - Unenforced CAPTCHAs, missing rate limiting
+   - Predictable CSRF tokens, weak session management
+   - Verbose error responses, username enumeration endpoints
+```
+
+### Protocol Testing (Manual Setup)
 
 ```
 1. proxy_start(target_host="api.example.com", target_port=443,
@@ -144,7 +198,7 @@ and the full Python standard library.
                listen_port=8080)
    → Instance ID: a1b2c3d4
 
-2. [Generate traffic through localhost:8080 via browser MCP or curl]
+2. [Generate traffic through localhost:8080 via browser or script]
 
 3. traffic_summary(instance_id="a1b2c3d4")
    → See message counts and data volumes

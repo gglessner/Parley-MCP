@@ -175,7 +175,7 @@ class ProxyInstance:
 
             # === Bidirectional data shuttle ===
             sockets_list = [client_socket, forward_socket]
-            buffer_size = 4096
+            buffer_size = 65536
             client_msg_num = 0
             server_msg_num = 0
 
@@ -189,6 +189,10 @@ class ProxyInstance:
                         if not data:
                             break
                         full_data.extend(data)
+                        # For SSL sockets, drain all pending records
+                        # from the SSL buffer before returning
+                        if hasattr(s, 'pending') and s.pending() > 0:
+                            continue
                         if len(data) < buffer_size:
                             break
 
@@ -249,14 +253,17 @@ class ProxyInstance:
 
                             client_socket.sendall(full_data)
                     else:
-                        # Socket closed - remove from list
-                        sockets_list.remove(s)
-                        try:
-                            s.close()
-                        except Exception:
-                            pass
-                        if not sockets_list:
-                            break
+                        # Socket closed - end the proxied session.
+                        # When either side disconnects, the proxy is done.
+                        # Close all sockets and clear the list so the
+                        # outer while-loop exits too.
+                        for sock in list(sockets_list):
+                            try:
+                                sock.close()
+                            except Exception:
+                                pass
+                        sockets_list.clear()
+                        break
 
         except OSError as e:
             # Common disconnection errors (cross-platform errnos)
