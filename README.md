@@ -94,29 +94,29 @@ JS domain patching, security header stripping, cache busting, and hotlinker bypa
 ## Architecture
 
 ```
-┌─────────────┐     ┌─────────────────────────────────────────┐
-│  AI Agent   │────>│            Parley-MCP Server             │
-│  (Cursor)   │<────│                                         │
-└─────────────┘     │  ┌──────────┐  ┌──────────────────────┐ │
-     MCP            │  │  Proxy   │  │   Module Manager     │ │
-                    │  │  Engine  │──│  (compile/cache/exec) │ │
-                    │  └────┬─────┘  └──────────────────────┘ │
-                    │       │                                  │
-                    │  ┌────▼─────────────────────┐           │
-                    │  │   SQLite3 Database        │           │
-                    │  │  (instances/connections/  │           │
-                    │  │   messages/modules)       │           │
-                    │  └──────────────────────────┘           │
-                    └─────────────────────────────────────────┘
-                              │
-              ┌───────────────┼───────────────┐
-              ▼               ▼               ▼
-         ┌─────────┐   ┌─────────┐   ┌─────────┐
-         │ Instance │   │ Instance │   │ Instance │
-         │ Thread 1 │   │ Thread 2 │   │ Thread N │
-         └────┬─────┘   └─────────┘   └─────────┘
-              │
-    Client ◄──┼──► Target Server
++---------------+     +-------------------------------------------+
+|   AI Agent    |---->|           Parley-MCP Server                |
+|   (Cursor)    |<----|                                           |
++---------------+     |  +----------+  +------------------------+ |
+      MCP             |  |  Proxy   |  |    Module Manager      | |
+                      |  |  Engine  |--|  (compile/cache/exec)  | |
+                      |  +----+-----+  +------------------------+ |
+                      |       |                                    |
+                      |  +----v--------------------------+         |
+                      |  |      SQLite3 Database         |         |
+                      |  |   (instances/connections/     |         |
+                      |  |    messages/modules)          |         |
+                      |  +------------------------------+         |
+                      +-------------------------------------------+
+                                    |
+                  +-----------------+-----------------+
+                  |                 |                 |
+            +-----------+   +-----------+   +-----------+
+            | Instance  |   | Instance  |   | Instance  |
+            | Thread 1  |   | Thread 2  |   | Thread N  |
+            +-----+-----+   +-----------+   +-----------+
+                  |
+     Client <-----+-----> Target Server
 ```
 
 ### Data Flow
